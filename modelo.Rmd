@@ -1,0 +1,835 @@
+---
+title: "R_Model"
+author: "Fabiano Caetano Foroni"
+date: '2022-07-15'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(message = FALSE)
+```
+
+A terceira etapa foi focada em:
+- LightGBM;
+- XGBoost;
+- Hiperparametrização;
+- análise de resultado;
+- cross-validation. 
+
+```{r libraries}
+library(dataPreparation)
+library(tidyverse)
+library(ggplot2)
+library(arrow)
+library(caTools)
+library(CatEncoders)
+library(caret)
+library(lightgbm)
+library(pROC)
+require(xgboost)
+library(MLmetrics)
+library(ROCR)
+library(ROCit)
+library(cvms)
+library(lares)
+library(Ckmeans.1d.dp)
+```
+
+
+Na tabela para modelagem devem ficar somente as colunas que são de fato utilizadas pelo modelo.
+
+
+```{r df_select}
+df <- select(df
+   , 'data_formalizacao'
+   , 'NOME_ITEM_FINANCIADO_2'
+   , 'idade_cliente_anos'
+   , 'valor_agro_interno_vincendo'
+   , 'valor_proposta_cred' 
+   , 'finalidade'
+   , 'imovel_rural_vl_bem'
+   , 'imovel_urbano_vl_bem'
+   , 'moveis_qt'
+   , 'moveis_vl_bem'
+   , 'semoventes_vl_bem'
+   , 'qt_dias_formalizacao_inicio_seg'
+   , 'qt_tmp_rlc'
+   , 'grt_hipoteca'
+   , 'qt_prod'
+   , 'area_total_pro'
+   , 'qt_prod_propria'
+   , 'vl_opr_cred_emprest_financ'
+   , 'target')
+```
+
+
+#### Treino, Teste e Out of Time
+
+Depois de fazer todos os tratamentos necessários nas variáveis, é necessário separar a base em treino e teste.
+É interessante também separar a base para um período 'out of time'.
+Em algumas situações, somente pelo fato de teste e treino serem realizados no mesmo período de tempo, já pode ser considerado um vazamento de informação. O 'out of time' garante que o modelo performa bem em qualquer período.
+O ideal seria já fazer o 'cross-validation' junto com as escolhas dos hiperparametros. Entretanto, a base de dados é grande e o cross-validation faria com que demorasse muito a execução do código. Assim, foi feito um cross-validation depois de já terem sido escolhidos os parâmetros somente para garantir que os resultados não foram obtidos por sorte.
+
+Os passos para a separação de treino e teste no projeto são:
+- Primeiro separar os meses de agosto e setembro de 2020 para a 'Out of Time'
+- Depois, separar 80% para a base Treino e 20% para a Teste
+- Além disso, para modelagem foram retiradas as observações com 'FINALIDADE' == 'INVESTIMENTO' (100% dos clientes nessa categoria contrataram o seguro). Depois de realizar a escoragem, será adicionado uma condicional colocando 'score' igual a 1 caso 'FINALIDADE' == 'INVESTIMENTO'.
+
+
+```{r train_test}
+# Separa amostra out of time (agosto e setembro de 2020)
+df['ANO_FORMALIZACAO'] <- as.numeric(format(df[['data_formalizacao']],'%Y'))
+df['MES_FORMALIZACAO'] <- as.numeric(format(df[['data_formalizacao']],'%m'))
+df['ANO_MES'] <- paste0(df[['ANO_FORMALIZACAO']], '_', df[['MES_FORMALIZACAO']])
+
+# Out of time
+filter_out_of_tim <- (df['ANO_MES'] == '2020_9') | (df['ANO_MES'] == '2020_8')
+df_out_of_time <- df[filter_out_of_tim,]
+
+df_in_time <- df[!filter_out_of_tim,]
+
+# Gatilho. Para a realização dos testes de performance, foi adicionada uma condicional acionando o gatilho para a base out of time.
+df_in_time <- filter(df_in_time, df_in_time['finalidade'] != 'INVESTIMENTO')
+
+# Separa treino e teste
+set.seed(1) 
+test_size <- 0.20
+sample = sample.split(df_in_time$target, SplitRatio = (1 - test_size))  # Garante a mesma proporção da target no treino e no teste
+df_train = subset(df_in_time, sample == TRUE)
+df_test  = subset(df_in_time, sample == FALSE)
+```
+
+Agora foram feitos os tratamentos finais para o modelo:
+- criação da variável 'qt_dias_formalizacao_inicio_seg_2' para as observações que não contrataram o seguro;
+- padronização das variáveis. Passo importante para usar regularizadores como 'Lasso' ou 'Ridge'; e
+- criação de tabela com 'target encoder' para usar no 'XGBoost'.
+
+```{r train_test_2}
+# Repete a mesma distribuição de 'qt_dias_formalizacao_inicio_seg' quando target = 1 para quando target = 0.
+set.seed(1)
+df_train_target_1 <- df_train[(df_train['target'] == 1),]
+list_random_choice <- df_train_target_1$qt_dias_formalizacao_inicio_seg
+# Treino
+df_train[(df_train['target'] == 0),'qt_dias_formalizacao_inicio_seg'] <- sample(list_random_choice, size = nrow(df_train[(df_train['target'] == 0),]), replace = TRUE)
+# Teste
+df_test[(df_test['target'] == 0),'qt_dias_formalizacao_inicio_seg'] <- sample(list_random_choice, size = nrow(df_test[(df_test['target'] == 0),]), replace = TRUE)
+# Out of time
+df_out_of_time[(df_out_of_time['target'] == 0),'qt_dias_formalizacao_inicio_seg'] <- sample(list_random_choice, size = nrow(df_out_of_time[(df_out_of_time['target'] == 0),]), replace = TRUE)
+
+
+# Separa as variáveis resposta e explicativas
+target_name <- 'target'
+X_features <- c('valor_proposta_cred'
+             , 'NOME_ITEM_FINANCIADO_2'
+             , 'idade_cliente_anos'
+             , "valor_agro_interno_vincendo"
+             , 'imovel_rural_vl_bem'
+             , 'imovel_urbano_vl_bem'
+             , 'moveis_qt'
+             , 'moveis_vl_bem'
+             , 'semoventes_vl_bem'
+             , 'qt_dias_formalizacao_inicio_seg'
+             , 'qt_tmp_rlc'
+             , 'grt_hipoteca'
+             , 'qt_prod'
+             , 'area_total_pro'
+             , 'qt_prod_propria'   
+             , 'vl_opr_cred_emprest_financ')
+   
+# Define as variáveis contínuas
+scalar_variables <- c('valor_proposta_cred'
+                    , 'idade_cliente_anos'
+                    , 'valor_agro_interno_vincendo'
+                    , 'imovel_rural_vl_bem'
+                    , 'imovel_urbano_vl_bem'
+                    , 'moveis_qt'
+                    , 'moveis_vl_bem'
+                    , 'semoventes_vl_bem'
+                    , 'qt_dias_formalizacao_inicio_seg'
+                    , 'qt_tmp_rlc'
+                    , 'qt_prod'
+                    , 'area_total_pro'
+                    , 'qt_prod_propria'
+                    , 'vl_opr_cred_emprest_financ')
+
+categorical_variables <- c("NOME_ITEM_FINANCIADO_2", "grt_hipoteca")
+
+# Define treino, teste e out of time
+X_train = select(df_train, all_of(X_features))
+X_test = select(df_test, all_of(X_features)) 
+# Target
+y_train = select(df_train, target_name)
+y_test = select(df_test, target_name)
+# Out of time
+X_out_of_time = select(df_out_of_time, all_of(X_features))
+# Target
+y_out_of_time = select(df_out_of_time, target_name)
+
+# Normaliza os dados
+normParam <- preProcess(X_train)
+X_train_normalized <- predict(normParam, X_train)
+X_test_normalized <- predict(normParam, X_test)
+X_out_of_time_normalized <- predict(normParam, X_out_of_time)
+
+cat('Tamanho tabela treino:', dim(X_train_normalized)[1])
+cat('\nTamanho tabela teste:', dim(X_test_normalized)[1])
+cat('\nTamanho tabela out of time:', dim(X_out_of_time_normalized)[1])
+```
+
+
+```{r ordinal_encoder}
+# Ordinal encoder para ser usado no LightGBM
+NOME_ITEM_FINANCIADO_2_ordinal_encoder = LabelEncoder.fit(X_train_normalized$NOME_ITEM_FINANCIADO_2)
+GRT_HIPOTECA_ordinal_encoder = LabelEncoder.fit(X_train_normalized$grt_hipoteca)
+# Aplica o encoder no treino
+X_train_ordinal_encoded <- X_train_normalized
+X_train_ordinal_encoded$NOME_ITEM_FINANCIADO_2 <- transform(NOME_ITEM_FINANCIADO_2_ordinal_encoder, X_train_normalized$NOME_ITEM_FINANCIADO_2)
+X_train_ordinal_encoded$GRT_HIPOTECA <- transform(GRT_HIPOTECA_ordinal_encoder, X_train_normalized$grt_hipoteca)
+# Aplica o encoder no teste
+X_test_ordinal_encoded <- X_test_normalized
+X_test_ordinal_encoded$NOME_ITEM_FINANCIADO_2 <- transform(NOME_ITEM_FINANCIADO_2_ordinal_encoder, X_test_normalized$NOME_ITEM_FINANCIADO_2)
+X_test_ordinal_encoded$GRT_HIPOTECA <- transform(GRT_HIPOTECA_ordinal_encoder, X_test_normalized$grt_hipoteca)
+# Aplica o encoder no out of time
+X_out_of_time_ordinal_encoded <- X_out_of_time_normalized
+X_out_of_time_ordinal_encoded$NOME_ITEM_FINANCIADO_2 <- transform(NOME_ITEM_FINANCIADO_2_ordinal_encoder, X_out_of_time_normalized$NOME_ITEM_FINANCIADO_2)
+X_out_of_time_ordinal_encoded$GRT_HIPOTECA <- transform(GRT_HIPOTECA_ordinal_encoder, X_out_of_time_normalized$grt_hipoteca)
+```
+
+
+```{r target_encoder}
+# No R, a target e as variáveis explicativas tem que ficar na mesma tabela.
+y_X_train_normalized <- cbind(y_train, X_train_normalized)
+y_X_test_normalized <- cbind(y_test, X_test_normalized)
+y_X_out_of_time_normalized <- cbind(y_out_of_time, X_out_of_time_normalized)
+
+# Target encoder para ser usado no XGBoost
+# Cria treino e teste com target encoder
+y_X_train_normalized_encoders <- build_target_encoding(y_X_train_normalized, cols_to_encode = c("NOME_ITEM_FINANCIADO_2", "grt_hipoteca"), target_col = "target")
+# Aplica o encoder no treino
+y_X_train_target_encoded <- target_encode(y_X_train_normalized, target_encoding = y_X_train_normalized_encoders)
+y_X_train_target_encoded <- select(y_X_train_target_encoded, -c("NOME_ITEM_FINANCIADO_2", "grt_hipoteca"))
+# Aplica o encoder no teste
+y_X_test_target_encoded <- target_encode(y_X_test_normalized, target_encoding = y_X_train_normalized_encoders)
+y_X_test_target_encoded <- select(y_X_test_target_encoded, -c("NOME_ITEM_FINANCIADO_2", "grt_hipoteca"))
+# Aplica o encoder no out of time
+y_X_out_of_time_target_encoded <- target_encode(y_X_out_of_time_normalized, target_encoding = y_X_train_normalized_encoders)
+y_X_out_of_time_target_encoded <- select(y_X_out_of_time_target_encoded, -c("NOME_ITEM_FINANCIADO_2", "grt_hipoteca"))
+```
+
+
+```{r LightGBM, results = FALSE, warning = FALSE}
+# Função para plotar performance de treino e teste.
+print_plot_best_hyperparameter_result <- function(hyperparameter_result, title){
+  ggplot(hyperparameter_result$resultados, aes(x = parameter)) +                    
+  geom_line(aes(y = metrica_comparacao_train, colour="Train"), linetype = "dashed") +
+  geom_line(aes(y = metrica_comparacao_test, colour="Test"), linetype = "dashed") +
+  scale_color_manual(values = c("Train" = "red", "Test" = "blue")) +
+  ggtitle(title) + ylab('ROC AUC') +
+  theme(plot.title = element_text(hjust = 0.5),   # Para centralizar o título
+          panel.background = element_rect(fill = 'white', colour = 'white'))
+}
+
+# Função de hiperparametrização do LightGBM
+hyperparameter_LGBMClassifier <- function(X_train, lgb.df_X_train, y_train, X_test, y_test, hyperparameters_dict, hyperparameter_test_name, test_hyperparameters){
+  returned_values <- NULL
+  metrica_comparacao_train <- NULL
+  metrica_comparacao_test <- NULL
+  parameters_tested <- NULL
+  for (parameter in test_hyperparameters){
+    parameters_tested <- c(parameters_tested, parameter)
+    # Muda o valor do hyperparametro testado
+    hyperparameters_dict[hyperparameter_test_name] <- parameter
+    # modelo LightGBM
+    lgb.model = lgb.train(params = hyperparameters_dict, data = lgb.df_X_train, nrounds = 50)
+    # predict
+    y_pred_train = predict(lgb.model, as.matrix(X_train)) 
+    y_pred_test = predict(lgb.model, as.matrix(X_test)) 
+    
+    # Guarda métricas de comparação
+    metrica_comparacao_train <- c(metrica_comparacao_train, roc(y_train, y_pred_train)$auc)
+    metrica_comparacao_test <- c(metrica_comparacao_test, roc(y_test, y_pred_test)$auc)
+  }
+  # Save results
+  metrica_comparacao_df <- cbind(parameters_tested, metrica_comparacao_train, metrica_comparacao_test)
+  metrica_comparacao_df <- data.frame(metrica_comparacao_df)
+  colnames(metrica_comparacao_df) <- c('parameter', 'metrica_comparacao_train', 'metrica_comparacao_test')
+  # Return the best hyperparameter and table with metrics
+  returned_values[hyperparameter_test_name] <- metrica_comparacao_df[metrica_comparacao_df$metrica_comparacao_test == max(metrica_comparacao_df$metrica_comparacao_test),]$parameter
+  returned_values$resultados <- metrica_comparacao_df
+  return(returned_values) # Correto: return(returned_values)
+}
+
+hyperparameters_dict <- list(objective = "binary",
+            metric = "binary_logloss",
+            boosting_type = "gbdt",
+            verbose = -1,
+            seed = 1,
+            min_data_in_leaf = 3500,
+            num_leaves = 30,
+            max_depth = 15,
+            feature_fraction = 1,
+            learning_rate = 0.58)
+
+# Cria um data frame LightGBM
+lgbm_df_train = lgb.Dataset(as.matrix(X_train_ordinal_encoded), label = y_train$target, colnames = colnames(X_train_ordinal_encoded), categorical_feature = categorical_variables)
+    
+# Testa min_data_in_leaf
+print('Test min_data_in_leaf:  from 3500 to 7000.')
+hyperparameter_test_name <- 'min_data_in_leaf'
+test_hyperparameters <- c(3500, 3600, 3700, 3800, 3900, 4000, 4100, 4200, 4300, 4400, 4500, 5000, 6000, 7000)
+hyperparameter_result = hyperparameter_LGBMClassifier(X_train_ordinal_encoded, lgbm_df_train, y_train$target, X_test_ordinal_encoded, y_test$target, hyperparameters_dict, hyperparameter_test_name, test_hyperparameters)
+# Salva melhor resultado.
+hyperparameters_dict[hyperparameter_test_name] = hyperparameter_result[hyperparameter_test_name]
+```
+
+```{r LightGBM_min_data_in_leaf_plot}
+title = 'min_data_in_leaf'
+print_plot_best_hyperparameter_result(hyperparameter_result, title)
+```
+
+```{r LightGBM_num_leaves, results = FALSE, warning = FALSE}
+# Testa num_leaves
+print('Test num_leaves: from 5 to 40.')
+hyperparameter_test_name <- 'num_leaves'
+test_hyperparameters <- c(5:40)
+hyperparameter_result = hyperparameter_LGBMClassifier(X_train_ordinal_encoded, lgbm_df_train, y_train$target, X_test_ordinal_encoded, y_test$target, hyperparameters_dict, hyperparameter_test_name, test_hyperparameters)
+# Salva melhor resultado.
+hyperparameters_dict[hyperparameter_test_name] = hyperparameter_result[hyperparameter_test_name]
+```
+
+
+```{r LightGBM_num_leaves_plot}
+title = 'num_leaves'
+print_plot_best_hyperparameter_result(hyperparameter_result, title)
+```
+
+
+```{r LightGBM_max_depth, results = FALSE, warning = FALSE}
+# Testa max_depth
+print('Test max_depth:  from 2 to 30.')
+hyperparameter_test_name <- 'max_depth'
+test_hyperparameters <- c(2:30)
+hyperparameter_result = hyperparameter_LGBMClassifier(X_train_ordinal_encoded, lgbm_df_train, y_train$target, X_test_ordinal_encoded, y_test$target, hyperparameters_dict, hyperparameter_test_name, test_hyperparameters)
+# Salva melhor resultado.
+hyperparameters_dict[hyperparameter_test_name] = hyperparameter_result[hyperparameter_test_name]
+```
+
+
+```{r LightGBM_max_depth_plot}
+title = 'max_depth'
+print_plot_best_hyperparameter_result(hyperparameter_result, title)
+```
+
+
+```{r LightGBM_learning_rate, results = FALSE, warning = FALSE}
+# Testa learning_rate
+print('Test learning_rate: from 0.1 to 0.7.')
+hyperparameter_test_name <- 'learning_rate'
+test_hyperparameters <- seq(from = 0.1, to = 0.7, by = 0.01)
+hyperparameter_result = hyperparameter_LGBMClassifier(X_train_ordinal_encoded, lgbm_df_train, y_train$target, X_test_ordinal_encoded, y_test$target, hyperparameters_dict, hyperparameter_test_name, test_hyperparameters)
+# Salva melhor resultado.
+hyperparameters_dict[hyperparameter_test_name] = hyperparameter_result[hyperparameter_test_name]
+```
+
+
+```{r LightGBM_learning_rate_plot}
+title = 'learning_rate'
+print_plot_best_hyperparameter_result(hyperparameter_result, title)
+```
+
+```{r LightGBM_parametros_finais}
+hyperparameters_dict
+```
+
+
+```{r XGBoost, results = FALSE, warning = FALSE}
+# Função de hiperparametrização do XGBoost
+hyperparameter_XGBoost <- function(X_train, y_train, X_test, y_test, hyperparameters_dict, hyperparameter_test_name, test_hyperparameters){
+  returned_values <- NULL
+  metrica_comparacao_train <- NULL
+  metrica_comparacao_test <- NULL
+  parameters_tested <- NULL
+  for (parameter in test_hyperparameters){
+    parameters_tested <- c(parameters_tested, parameter)
+    # Muda o valor do hyperparametro testado
+    hyperparameters_dict[hyperparameter_test_name] <- parameter
+    # modelo XGBoost
+    xgboost.model <- xgboost(data = as.matrix(X_train), label = y_train, nrounds = 50, params = hyperparameters_dict)
+    # predict    
+    y_pred_train = predict(xgboost.model, as.matrix(X_train))
+    y_pred_test = predict(xgboost.model, as.matrix(X_test)) 
+    # Guarda métricas de comparação
+    metrica_comparacao_train <- c(metrica_comparacao_train, roc(y_train, y_pred_train)$auc)
+    metrica_comparacao_test <- c(metrica_comparacao_test, roc(y_test, y_pred_test)$auc)
+  }
+  # Save results
+  metrica_comparacao_df <- cbind(parameters_tested, metrica_comparacao_train, metrica_comparacao_test)
+  metrica_comparacao_df <- data.frame(metrica_comparacao_df)
+  colnames(metrica_comparacao_df) <- c('parameter', 'metrica_comparacao_train', 'metrica_comparacao_test')
+  # Return the best hyperparameter and table with metrics
+  returned_values[hyperparameter_test_name] <- metrica_comparacao_df[metrica_comparacao_df$metrica_comparacao_test == max(metrica_comparacao_df$metrica_comparacao_test),]$parameter
+  returned_values$resultados <- metrica_comparacao_df
+  return(returned_values) # Correto: return(returned_values)
+}
+
+hyperparameters_dict <- list(objective = 'binary:logistic',
+                        eval_metric = 'auc',
+                        seed = 1,
+                        verbosity = 0,
+                        validate_parameters = TRUE,
+                        tree_method = "hist",    
+                        booster = 'gbtree',       # gbtree, gblinear or dart.
+                        max_depth = 16,
+                        max_leaves = 69,
+                        min_child_weight = 100,
+                        subsample = 0.9,
+                        colsample_bytree = 0.8,
+                        learning_rate = 0.4,
+                        gamma = 0.48,
+                        reg_lambda = 0,
+                        reg_alpha = 5)
+
+# Testa min_child_weight
+print('Test min_child_weight:  from 1 to 3000.')
+hyperparameter_test_name = 'min_child_weight'
+test_hyperparameters = c(1, 50, 100, 200, 400, 600, 800, 1000, 1250, 1500, 1750, 2000, 2250, 2500, 2750, 3000)
+hyperparameter_result = hyperparameter_XGBoost(select(y_X_train_target_encoded, -target), y_train$target, select(y_X_test_target_encoded, -target), y_test$target, hyperparameters_dict, hyperparameter_test_name, test_hyperparameters)
+# Salva melhor resultado.
+hyperparameters_dict[hyperparameter_test_name] = hyperparameter_result[hyperparameter_test_name]
+```
+
+
+```{r XGBOsst_min_child_weight_plot}
+title = 'min_child_weight'
+print_plot_best_hyperparameter_result(hyperparameter_result, title)
+```
+
+
+```{r XGBoost_max_depth, results = FALSE, warning = FALSE}
+print('Test max_depth:  from 1 to 20.')
+hyperparameter_test_name = 'max_depth'
+test_hyperparameters = c(1:20)
+hyperparameter_result = hyperparameter_XGBoost(select(y_X_train_target_encoded, -target), y_train$target, select(y_X_test_target_encoded, -target), y_test$target, hyperparameters_dict, hyperparameter_test_name, test_hyperparameters)
+# Salva melhor resultado.
+hyperparameters_dict[hyperparameter_test_name] = hyperparameter_result[hyperparameter_test_name]
+```
+
+
+```{r XGBOsst_max_depth_plot}
+title = 'max_depth'
+print_plot_best_hyperparameter_result(hyperparameter_result, title)
+```
+
+
+```{r XGBoost_max_leaves, results = FALSE, warning = FALSE}
+print('Test max_leaves:  from 1 to 70.')
+hyperparameter_test_name = 'max_leaves'
+test_hyperparameters = c(1:70)
+hyperparameter_result = hyperparameter_XGBoost(select(y_X_train_target_encoded, -target), y_train$target, select(y_X_test_target_encoded, -target), y_test$target, hyperparameters_dict, hyperparameter_test_name, test_hyperparameters)
+# Salva melhor resultado.
+hyperparameters_dict[hyperparameter_test_name] = hyperparameter_result[hyperparameter_test_name]
+```
+
+
+```{r XGBOsst_max_leaves_plot}
+title = 'max_leaves'
+print_plot_best_hyperparameter_result(hyperparameter_result, title)
+```
+
+
+```{r XGBoost_subsample, results = FALSE, warning = FALSE}
+# Testa subsample
+print('Test subsample:  from 0.4 to 1.')
+hyperparameter_test_name = 'subsample'
+test_hyperparameters <- seq(from = 0.4, to = 1.04, by = 0.05)
+hyperparameter_result = hyperparameter_XGBoost(select(y_X_train_target_encoded, -target), y_train$target, select(y_X_test_target_encoded, -target), y_test$target, hyperparameters_dict, hyperparameter_test_name, test_hyperparameters)
+# Salva melhor resultado.
+hyperparameters_dict[hyperparameter_test_name] = hyperparameter_result[hyperparameter_test_name]
+```
+
+
+```{r XGBOsst_subsample_plot}
+title = 'subsample'
+print_plot_best_hyperparameter_result(hyperparameter_result, title)
+```
+
+
+```{r XGBoost_colsample_bytree, results = FALSE, warning = FALSE}
+# Testa colsample_bytree
+print('Test colsample_bytree:  from 0.4 to 1.')
+hyperparameter_test_name = 'colsample_bytree'
+test_hyperparameters <- seq(from = 0.4, to = 1.04, by = 0.05)
+hyperparameter_result = hyperparameter_XGBoost(select(y_X_train_target_encoded, -target), y_train$target, select(y_X_test_target_encoded, -target), y_test$target, hyperparameters_dict, hyperparameter_test_name, test_hyperparameters)
+# Salva melhor resultado.
+hyperparameters_dict[hyperparameter_test_name] = hyperparameter_result[hyperparameter_test_name]
+```
+
+
+```{r XGBOsst_colsample_bytree_plot}
+title = 'colsample_bytree'
+print_plot_best_hyperparameter_result(hyperparameter_result, title)
+```
+
+
+```{r XGBoost_learning_rate, results = FALSE, warning = FALSE}
+# Testa learning_rate
+print('Test learning_rate:  from 0.01 to 0.5.')
+hyperparameter_test_name = 'learning_rate'
+test_hyperparameters <- seq(from = 0.01, to = 0.501, by = 0.01)
+hyperparameter_result = hyperparameter_XGBoost(select(y_X_train_target_encoded, -target), y_train$target, select(y_X_test_target_encoded, -target), y_test$target, hyperparameters_dict, hyperparameter_test_name, test_hyperparameters)
+# Salva melhor resultado.
+hyperparameters_dict[hyperparameter_test_name] = hyperparameter_result[hyperparameter_test_name]
+```
+
+
+```{r XGBOsst_learning_rate_plot}
+title = 'learning_rate'
+print_plot_best_hyperparameter_result(hyperparameter_result, title)
+```
+
+
+```{r XGBoost_gamma, results = FALSE, warning = FALSE}
+# Testa gamma
+print('Test gamma:  from 0 to 0.5.')
+hyperparameter_test_name = 'gamma'
+test_hyperparameters <- seq(from = 0, to = 0.5001, by = 0.005)
+hyperparameter_result = hyperparameter_XGBoost(select(y_X_train_target_encoded, -target), y_train$target, select(y_X_test_target_encoded, -target), y_test$target, hyperparameters_dict, hyperparameter_test_name, test_hyperparameters)
+# Salva melhor resultado.
+hyperparameters_dict[hyperparameter_test_name] = hyperparameter_result[hyperparameter_test_name]
+```
+
+
+```{r XGBOsst_gamma_plot}
+title = 'gamma'
+print_plot_best_hyperparameter_result(hyperparameter_result, title)
+```
+
+
+```{r XGBoost_reg_lambda, results = FALSE, warning = FALSE}
+# Testa reg_lambda
+print('Test reg_lambda:  from 0 to 200.')
+hyperparameter_test_name = 'reg_lambda'
+test_hyperparameters <- seq(from = 0, to = 201, by = 5)
+hyperparameter_result = hyperparameter_XGBoost(select(y_X_train_target_encoded, -target), y_train$target, select(y_X_test_target_encoded, -target), y_test$target, hyperparameters_dict, hyperparameter_test_name, test_hyperparameters)
+# Salva melhor resultado.
+hyperparameters_dict[hyperparameter_test_name] = hyperparameter_result[hyperparameter_test_name]
+```
+
+
+```{r XGBOsst_reg_lambda_plot}
+title = 'reg_lambda'
+print_plot_best_hyperparameter_result(hyperparameter_result, title)
+```
+
+
+```{r XGBoost_reg_alpha, results = FALSE, warning = FALSE}
+# Testa reg_alpha
+print('Test reg_alpha:  from 0 to 200.')
+hyperparameter_test_name = 'reg_alpha'
+test_hyperparameters <- seq(from = 0, to = 201, by = 5)
+hyperparameter_result = hyperparameter_XGBoost(select(y_X_train_target_encoded, -target), y_train$target, select(y_X_test_target_encoded, -target), y_test$target, hyperparameters_dict, hyperparameter_test_name, test_hyperparameters)
+# Salva melhor resultado.
+hyperparameters_dict[hyperparameter_test_name] = hyperparameter_result[hyperparameter_test_name]
+```
+
+
+```{r XGBOsst_reg_alpha_plot}
+title = 'reg_alpha'
+print_plot_best_hyperparameter_result(hyperparameter_result, title)
+```
+
+
+```{r XGBoost_parametros_finais}
+hyperparameters_dict
+```
+
+Agora que já possuimos dois modelos, vamos comparar as métricas de performance deles.
+
+```{r LightGBM_XGBoost, results = FALSE, warning = FALSE}
+#LightGBM
+lightgbm_hyperparameters <- list(objective = "binary",
+            metric = "binary_logloss",
+            boosting_type = "gbdt",
+            verbose = -1,
+            seed = 1,
+            min_data_in_leaf = 3600,
+            num_leaves = 23,
+            max_depth = 12,
+            feature_fraction = 1,
+            learning_rate = 0.58)
+
+# fit and predict
+lgbm_df_train = lgb.Dataset(as.matrix(X_train_ordinal_encoded), label = y_train$target, colnames = colnames(X_train_ordinal_encoded), categorical_feature = categorical_variables)
+lgb.model = lgb.train(params <- lightgbm_hyperparameters, data = lgbm_df_train, nrounds = 50)
+y_pred_out_of_time_lightGBM <- predict(lgb.model, as.matrix(X_out_of_time_ordinal_encoded)) 
+# Adiciona o gatilho 
+df_out_of_time$y_pred_lightGBM <- y_pred_out_of_time_lightGBM
+df_out_of_time$y_pred_lightGBM <- ifelse(df_out_of_time$finalidade == 'INVESTIMENTO', 1, df_out_of_time$y_pred_lightGBM)
+df_out_of_time$y_pred_binario_lightGBM <- ifelse(df_out_of_time$y_pred_lightGBM > 0.5, 1, 0)
+
+y_out_of_time = df_out_of_time$target
+y_pred_out_of_time_lightGBM = df_out_of_time$y_pred_lightGBM
+y_pred_out_of_time_binary_lightGBM = df_out_of_time$y_pred_binario_lightGBM
+
+#XGBoost
+xgboost_hyperparameters <- list(objective = 'binary:logistic',
+                        eval_metric = 'auc',
+                        seed = 1,
+                        verbosity = 0,
+                        validate_parameters = TRUE,
+                        tree_method = "hist",    
+                        booster = 'gbtree',       # gbtree, gblinear or dart.
+                        max_depth = 16,
+                        max_leaves = 67,
+                        min_child_weight = 50,
+                        subsample = 0.8,
+                        colsample_bytree = 1,
+                        learning_rate = 0.48,
+                        gamma = 0.38,
+                        reg_lambda = 25,
+                        reg_alpha = 10)
+
+# fit and predict
+xgboost.model <- xgboost(data = as.matrix(select(y_X_train_target_encoded, -target)), label = y_train$target, nrounds = 50, params = xgboost_hyperparameters)
+# predict    
+y_pred_out_of_time_XGBoost = predict(xgboost.model, as.matrix(select(y_X_out_of_time_target_encoded, -target)))
+# Adiciona o gatilho 
+df_out_of_time$y_pred_XGBoost <- y_pred_out_of_time_XGBoost
+df_out_of_time$y_pred_XGBoost <- ifelse(df_out_of_time$finalidade == 'INVESTIMENTO', 1, df_out_of_time$y_pred_XGBoost)
+df_out_of_time$y_pred_binario_XGBoost <- ifelse(df_out_of_time$y_pred_XGBoost > 0.5, 1, 0)
+
+y_pred_out_of_time_XGBoost = df_out_of_time$y_pred_XGBoost
+y_pred_out_of_time_binary_XGBoost = df_out_of_time$y_pred_binario_XGBoost
+```
+
+Importância das variáveis:
+
+```{r LightGBM_feature_importance}
+# LightGBM
+table_lgb.importance <-lgb.importance(lgb.model, percentage = TRUE)
+table_lgb.importance
+```
+
+```{r LightGBM_feature_importance_plot}
+# LightGBM
+lgb.plot.importance(
+  table_lgb.importance,
+  top_n = 18L,
+  measure = "Gain",
+  left_margin = 10L,
+  cex = NULL
+)
+```
+
+
+```{r XGBoost_feature_importance}
+# XGBoost
+table_xgb.importance <- xgb.importance(model = xgboost.model)
+table_xgb.importance
+```
+
+
+```{r XGBoost_feature_importance_plot}
+# XGBoost
+xgb.ggplot.importance(importance_matrix = table_xgb.importance)
+```
+
+Métricas:
+
+```{r metricas_LightGBM}
+metricas <- function(y_real, y_pred, y_pred_bin){
+  cm <- confusionMatrix(factor(y_pred_bin), factor(y_real))
+  roc_auc <- roc(y_real, y_pred, quiet = TRUE)$auc
+  cat('ROC AUC:', roc_auc)
+  cat('\nAccuracy:', cm$overall['Accuracy'])
+  precision <- posPredValue(factor(y_pred_bin), factor(y_real), positive="1")
+  cat('\nPrecision:', precision)
+  recall <- cm$byClass['Specificity']
+  cat('\nRecall:', recall)
+  F1 <- (2 * precision * recall) / (precision + recall)
+  cat('\nF1:', F1)
+  cat('\nConfusion Matrix\n')
+  cfm <- as_tibble(cm$table)
+  plot_confusion_matrix(cfm, 
+                        target_col = "Reference", 
+                        prediction_col = "Prediction",
+                        counts_col = "n")
+}
+metricas_plot <- function(y_real, y_pred){
+  # ROC curve
+  ROCit_obj <- rocit(y_pred, class = y_real)
+  plot(ROCit_obj, YIndex = F)
+  # KS
+  ksplot(ROCit_obj)
+  # Cumulative gain curve
+  mplot_gain(factor(y_real), y_pred, target = "1")
+}
+
+# LightGBM
+metricas(y_out_of_time, y_pred_out_of_time_lightGBM, y_pred_out_of_time_binary_lightGBM)
+metricas_plot(y_out_of_time, y_pred_out_of_time_lightGBM)
+```
+
+
+```{r metricas_XGBoost}
+# XGBoost
+metricas(y_out_of_time, y_pred_out_of_time_XGBoost, y_pred_out_of_time_binary_XGBoost)
+metricas_plot(y_out_of_time, y_pred_out_of_time_XGBoost)
+```
+
+Agora que o modelo está pronto, é interessante fazer um teste de 'cross-validation' para ter certeza de que os resultados não foram obtidos por sorte.
+O ideal seria realizar o 'cross-validation' junto com a hiperparametrização. Porém, como a tabela é grande, isso faria com que a modelagem demorasse muito.
+Para fazer o 'cross-validation', foi utilizado o 'bootstrap sampling'.
+
+```{r bootstrap_lightgbm, results = FALSE, warning = FALSE}
+```
+
+```{r bootstrap, results = FALSE, warning = FALSE}
+#XGBoost
+xgboost_hyperparameters <- list(objective = 'binary:logistic',
+                        eval_metric = 'auc',
+                        seed = 1,
+                        verbosity = 0,
+                        validate_parameters = TRUE,
+                        tree_method = "hist",    
+                        booster = 'gbtree',       # gbtree, gblinear or dart.
+                        max_depth = 16,
+                        max_leaves = 67,
+                        min_child_weight = 50,
+                        subsample = 0.8,
+                        colsample_bytree = 1,
+                        learning_rate = 0.48,
+                        gamma = 0.38,
+                        reg_lambda = 25,
+                        reg_alpha = 10)
+
+# Bootstrap
+empty_df <- data.frame(error_rate = numeric(), sensitivity = numeric(), specificity = numeric())
+roc_train <- empty_df
+roc_test <- empty_df
+accuracy_train <- empty_df
+accuracy_test <- empty_df
+precisao_train <- empty_df
+precisao_test <- empty_df
+recall_train <- empty_df
+recall_test <- empty_df
+f1_train <- empty_df
+f1_test <- empty_df
+
+
+# Bootstrap
+for (i in c(1:10)){
+  bTrain <- sample(rep(c(TRUE,FALSE),length.out = nrow(df)))
+  df_train_bootstrap <- df[bTrain,]
+  # Retira finalidade == investimento.
+  df_train_bootstrap <- filter(df_train_bootstrap, df_train_bootstrap['finalidade'] != 'INVESTIMENTO')
+  df_test_bootstrap <- df[!bTrain,]
+  
+  # Monta qt_dias_formalizacao_inicio_seg
+  # Repete a mesma distribuição de qt_dias_formalizacao_inicio_seg quando target = 1 para quando target = 0.
+  df_train_bootstrap_target_1 <- df_train_bootstrap[(df_train_bootstrap['target'] == 1),]
+  list_random_choice <- df_train_bootstrap_target_1$qt_dias_formalizacao_inicio_seg
+  # Treino
+  df_train_bootstrap[(df_train_bootstrap['target'] == 0),'qt_dias_formalizacao_inicio_seg'] <- sample(list_random_choice, size = nrow(df_train_bootstrap[(df_train_bootstrap['target'] == 0),]), replace = TRUE)
+  # Teste
+  df_test_bootstrap[(df_test_bootstrap['target'] == 0),'qt_dias_formalizacao_inicio_seg'] <- sample(list_random_choice, size = nrow(df_test_bootstrap[(df_test_bootstrap['target'] == 0),]), replace = TRUE)
+
+  # Define treino, teste e out of time
+  X_train = select(df_train_bootstrap, all_of(X_features))
+  X_test = select(df_test_bootstrap, all_of(X_features)) 
+  # Target
+  y_train = select(df_train_bootstrap, target_name)
+  y_test = select(df_test_bootstrap, target_name)
+
+  # Normaliza os dados
+  normParam <- preProcess(X_train)
+  X_train_normalized <- predict(normParam, X_train)
+  X_test_normalized <- predict(normParam, X_test)
+
+  # Target encoder
+  # No R, a target e as variáveis explicativas tem que ficar na mesma tabela.
+  y_X_train_normalized <- cbind(y_train, X_train_normalized)
+  y_X_test_normalized <- cbind(y_test, X_test_normalized)
+
+  # Target encoder para ser usado no XGBoost
+  # Cria treino e teste com target encoder
+  y_X_train_normalized_encoders <- build_target_encoding(y_X_train_normalized, cols_to_encode = c("NOME_ITEM_FINANCIADO_2", "grt_hipoteca"), target_col = "target")
+  # Aplica o encoder no treino
+  y_X_train_target_encoded <- target_encode(y_X_train_normalized, target_encoding = y_X_train_normalized_encoders)
+  y_X_train_target_encoded <- select(y_X_train_target_encoded, -c("NOME_ITEM_FINANCIADO_2", "grt_hipoteca"))
+  # Aplica o encoder no teste
+  y_X_test_target_encoded <- target_encode(y_X_test_normalized, target_encoding = y_X_train_normalized_encoders)
+  y_X_test_target_encoded <- select(y_X_test_target_encoded, -c("NOME_ITEM_FINANCIADO_2", "grt_hipoteca"))
+
+  # fit and predict
+  xgboost.model <- xgboost(data = as.matrix(select(y_X_train_target_encoded, -target)), label = y_train$target, nrounds = 50, params = xgboost_hyperparameters)
+  # predict   
+  y_pred_train = predict(xgboost.model, as.matrix(select(y_X_train_target_encoded, -target)))
+  y_pred_test = predict(xgboost.model, as.matrix(select(y_X_test_target_encoded, -target)))
+  # Adiciona o gatilho 
+  df_train_bootstrap$y_pred_train <- y_pred_train
+  df_train_bootstrap$y_pred_train <- ifelse(df_train_bootstrap$finalidade == 'INVESTIMENTO', 1, df_train_bootstrap$y_pred_train)
+  df_train_bootstrap$y_pred_binario_train <- ifelse(df_train_bootstrap$y_pred_train > 0.5, 1, 0)
+  y_pred_train = df_train_bootstrap$y_pred_train
+  y_pred_train_binary = df_train_bootstrap$y_pred_binario_train
+  
+  df_test_bootstrap$y_pred_test <- y_pred_test
+  df_test_bootstrap$y_pred_test <- ifelse(df_test_bootstrap$finalidade == 'INVESTIMENTO', 1, df_test_bootstrap$y_pred_test)
+  df_test_bootstrap$y_pred_binario_test <- ifelse(df_test_bootstrap$y_pred_test > 0.5, 1, 0)
+  y_pred_test = df_test_bootstrap$y_pred_test
+  y_pred_test_binary = df_test_bootstrap$y_pred_binario_test
+  
+  # Metricas
+  cm_train <- confusionMatrix(factor(y_pred_train_binary), factor(y_train$target))
+  cm_test <- confusionMatrix(factor(y_pred_test_binary), factor(y_test$target))
+  
+  roc_train <- rbind(roc_train, roc(y_train$target, y_pred_train, quiet = TRUE)$auc)
+  roc_test <- rbind(roc_test, roc(y_test$target, y_pred_test, quiet = TRUE)$auc)
+  
+  accuracy_train <- rbind(accuracy_train, cm_train$overall['Accuracy'])
+  accuracy_test <- rbind(accuracy_test, cm_test$overall['Accuracy'])
+  
+  precisao_train <- rbind(precisao_train, posPredValue(factor(y_pred_train_binary), factor(y_train$target), positive="1"))
+  precisao_test <- rbind(precisao_test, posPredValue(factor(y_pred_test_binary), factor(y_test$target), positive="1"))
+  
+  recall_train <- rbind(recall_train, cm_train$byClass['Specificity'])
+  recall_test <- rbind(recall_test, cm_test$byClass['Specificity'])
+  
+  f1_train <- rbind(f1_train, (2 * precisao_train * recall_train) / (precisao_train + recall_train))
+  f1_test <- rbind(f1_test, (2 * precisao_test * recall_test) / (precisao_test + recall_test))
+}
+
+# Nomeia as colunas
+colnames(roc_train) <- 'Treino'
+colnames(accuracy_train) <- 'Treino'
+colnames(precisao_train) <- 'Treino'
+colnames(recall_train) <- 'Treino'
+colnames(f1_train) <- 'Treino'
+
+colnames(roc_test) <- 'Teste'
+colnames(accuracy_test) <- 'Teste'
+colnames(precisao_test) <- 'Teste'
+colnames(recall_test) <- 'Teste'
+colnames(f1_test) <- 'Teste'
+
+roc_df <- cbind(roc_train[1], roc_test[1])
+accuracy_df <- cbind(accuracy_train[1], accuracy_test[1])
+precisao_df <- cbind(precisao_train[1], precisao_test[1])
+recall_df <- cbind(recall_train[1], recall_test[1])
+f1_df <- cbind(f1_train[1], f1_test[1])
+```
+
+
+
+
+```{r cross_validation_results}
+# Plota
+boxplot(roc_df, main = 'ROC AUC')
+boxplot(accuracy_df, main = 'Acurácia')
+boxplot(precisao_df, main = 'Precisão')
+boxplot(recall_df, main = 'Recall')
+boxplot(f1_df, main = 'F1')
+```
+
+

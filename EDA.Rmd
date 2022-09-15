@@ -1,0 +1,869 @@
+---
+title: "R_EDA"
+author: "Fabiano Caetano Foroni"
+date: '2022-07-07'
+output:
+  html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(message = FALSE)
+```
+
+```{r libraries}
+library(openxlsx)
+library(reshape2)
+library(tidyverse)
+library(ggplot2)
+library(arrow)
+```
+
+Objetivos:
+- funções de usuário para plotar gráficos;
+- análise de variáveis categóricas;
+- análise de variáveis contínuas;
+- matriz de correlação;
+- pairplot;
+- análise bivariada.
+
+
+Um projeto de ciência de dados possui muitas variáveis para analizar. Assim, para facilitar a análise, é melhor construir funções para plotar gráficos. Isso torna o código mais simples e compreensível.
+
+
+```{r funcoes_graficos_1}
+# Função para fazer gráficos de barras para variáveis categóricas
+bar_graph_categoric_var <- function(df, variable, title, x_rotation = 45, ...) {
+  ggplot(df, aes(x = fct_infreq(.data[[variable]], ordered = NA), label = scales::percent(round(prop.table(stat(count)), 3)))) +
+    geom_bar(fill = 'blue') +
+    geom_text(stat = 'count',vjust = -0.5, size = 3) +
+    ggtitle(title) + 
+    xlab('') + 
+    theme(plot.title = element_text(hjust = 0.5),   # Para centralizar o título
+          panel.background = element_rect(fill = 'white', colour = 'white'),
+          axis.text.x = element_text(angle = x_rotation, size = 8, hjust = 1))  
+}
+
+# Função para fazer gráficos de barras para variáveis contínuas
+bar_graf <- function(df, variable, x_limits, title, bins = 10, ...) {
+  histograma_aux <- hist(df[[variable]], breaks = bins, plot = FALSE);
+  histograma <- hist(df[[variable]], breaks = bins, col = "blue", xlab = '', xlim = x_limits, ylim = c(0, max(histograma_aux$counts) + 0.1*max(histograma_aux$counts)), main = title);
+}
+
+box_plot <- function(df, variable, y_limits, title) {
+  boxplot(df[[variable]], col = "blue",ylim = y_limits, main = title)
+  points(1, mean(df[[variable]]), col = 'red')
+}
+```
+
+Primeiro, as análises das variáveis categóricas:
+- 'nome_item_financiado' 
+- 'finalidade' 
+- 'grt_hipoteca' 
+
+```{r nome_item_financiado}
+variable = 'nome_item_financiado'
+title = 'Item financiado'
+
+value_counts <- count(df, .dots = variable) 
+value_counts$percent <-(value_counts$n/sum(value_counts$n)*100)
+value_counts <- value_counts[order(-value_counts$percent),]
+value_counts$percent <- sprintf("%0.2f%%", value_counts$percent)
+head(value_counts, n = 15)
+cat('Quantidade de categorias:', dim(value_counts)[1])
+
+# Plota o grafico de frequencia
+bar_graph_categoric_var(df, variable, title, x_rotation = 45)
+```
+
+Existem 355 categorias diferentes de item financiado. Além disso, a maioria com um baixo volume de observações. Depois, será necessário dar maior atenção a essa variável.
+
+
+```{r finalidade}
+variable = 'finalidade'
+title = 'Finalidade'
+
+value_counts <- count(df, .dots = variable) 
+value_counts$percent <-(value_counts$n/sum(value_counts$n)*100)
+value_counts <- value_counts[order(-value_counts$percent),]
+value_counts$percent <- sprintf("%0.2f%%", value_counts$percent)
+head(value_counts, n = Inf)
+
+# Plota o grafico de frequencia
+bar_graph_categoric_var(df, variable, title, x_rotation = 45)
+```
+
+```{r grt_hipoteca}
+variable = 'grt_hipoteca'
+title = 'Possui hipoteca'
+
+value_counts <- count(df, .dots = variable) 
+value_counts$percent <-(value_counts$n/sum(value_counts$n)*100)
+value_counts <- value_counts[order(-value_counts$percent),]
+value_counts$percent <- sprintf("%0.2f%%", value_counts$percent)
+head(value_counts, n = Inf)
+
+# Plota o grafico de frequencia
+bar_graph_categoric_var(df, variable, title, x_rotation = 45)
+```
+
+Agora os estudos das variáveis contínuas. Para estas, além dos histogramas, foram montados também os box plot.
+
+```{r qt_dias_formalizacao_inicio_seg}
+variable = 'qt_dias_formalizacao_inicio_seg'
+title = 'Dias da formalizacao ate a contratacao do seguro'
+x_limits = c(0, 200)
+bins = 100
+bar_graf(df, variable, x_limits, title, bins)
+
+y_limits = c(0, 100)
+box_plot(df, variable, y_limits, title)
+
+media = mean(df[[variable]])
+mediana = median(df[[variable]])
+cat(variable, 'media:', media, '\n')
+cat(variable, 'mediana:', mediana)
+```
+
+É importante lembrar que essa variável possui uma grande quantidade de missing. Ela somente possui preenchimento quando a nossa target é igual a 1.
+Para preencher os missings, será necessário garantir que a distribuição dela seja a mesma para quando a target é 1 e para quando é 0. Entretanto, isso somente pode ser feito no processo de modelagem para serem usados os parâmetros da base de treino e, depois, aplicar a transformação no treino e teste.
+
+```{r valor_proposta_cred}
+variable = 'valor_proposta_cred'
+title = 'Valor proposta'
+x_limits = c(1000, 1500000)
+bins = 200
+bar_graf(df, variable, x_limits, title, bins)
+
+y_limits = c(1000, 1500000)
+box_plot(df, variable, y_limits, title)
+
+media = mean(df[[variable]])
+mediana = median(df[[variable]])
+cat(variable, 'media:', media, '\n')
+cat(variable, 'mediana:', mediana)
+```
+
+```{r valor_agro_interno_vincendo}
+variable = 'valor_agro_interno_vincendo'
+title = 'Divida agro vincendo'
+x_limits = c(0, 5000000)
+bins = 200
+bar_graf(df, variable, x_limits, title, bins)
+
+y_limits = c(0, 5000000)
+box_plot(df, variable, y_limits, title)
+
+media = mean(df[[variable]])
+mediana = median(df[[variable]])
+cat(variable, 'media:', media, '\n')
+cat(variable, 'mediana:', mediana)
+```
+
+```{r idade_cliente_anos}
+variable = 'idade_cliente_anos'
+title = 'Idade'
+x_limits = c(15, 85)
+bins = 15
+bar_graf(df, variable, x_limits, title, bins)
+
+y_limits = c(15, 85)
+box_plot(df, variable, y_limits, title)
+
+media = mean(df[[variable]])
+mediana = median(df[[variable]])
+cat(variable, 'media:', media, '\n')
+cat(variable, 'mediana:', mediana)
+```
+
+```{r qt_tmp_rlc}
+variable = 'qt_tmp_rlc'
+title = 'Tempo de relacionamento'
+x_limits = c(0, 50)
+bins = 80
+bar_graf(df, variable, x_limits, title, bins)
+
+y_limits = c(0, 50)
+box_plot(df, variable, y_limits, title)
+
+media = mean(df[[variable]])
+mediana = median(df[[variable]])
+cat(variable, 'media:', media, '\n')
+cat(variable, 'mediana:', mediana)
+```
+
+```{r qt_dpte}
+variable = 'qt_dpte'
+title = 'Quantidade de dependentes'
+x_limits = c(0, 10)
+bins = 30
+bar_graf(df, variable, x_limits, title, bins)
+
+y_limits = c(0, 10)
+box_plot(df, variable, y_limits, title)
+
+media = mean(df[[variable]])
+mediana = median(df[[variable]])
+cat(variable, 'media:', media, '\n')
+cat(variable, 'mediana:', mediana)
+```
+
+Essa variável pode ser tratada também como uma variável categórica.
+
+```{r qt_dpte_2}
+variable = 'qt_dpte'
+title = 'Quantidade de dependentes'
+# As vezes, somente o gráfico fica difícil de ver algumas categorias. Assim, é interessante montar uma tabela mostrando quantas observações cada categoria possui.
+value_counts <- count(df, .dots = variable) 
+value_counts$percent <-(value_counts$n/sum(value_counts$n)*100)
+value_counts <- value_counts[order(-value_counts$percent),]
+value_counts$percent <- sprintf("%0.2f%%", value_counts$percent)
+head(value_counts, n = Inf)
+
+# Plota o grafico de frequencia
+df_aux <- df
+df_aux[[variable]] <- factor(df_aux[[variable]])
+bar_graph_categoric_var(df_aux, variable, title, x_rotation = 0)
+```
+
+```{r imovel_rural_vl_bem}
+variable = 'imovel_rural_vl_bem'
+title = 'Valor dos imoveis rurais'
+x_limits = c(0, 80000000)
+bins = 1000000
+bar_graf(df, variable, x_limits, title, bins)
+
+y_limits = c(0, 80000000)
+box_plot(df, variable, y_limits, title)
+
+media = mean(df[[variable]])
+mediana = median(df[[variable]])
+cat(variable, 'media:', media, '\n')
+cat(variable, 'mediana:', mediana)
+```
+
+```{r imovel_urbano_vl_bem}
+variable = 'imovel_urbano_vl_bem'
+title = 'Valor dos imóveis urbanos'
+x_limits = c(0, 1500000)
+bins = 1000000
+bar_graf(df, variable, x_limits, title, bins)
+
+y_limits = c(0, 1500000)
+box_plot(df, variable, y_limits, title)
+
+media = mean(df[[variable]])
+mediana = median(df[[variable]])
+cat(variable, 'media:', media, '\n')
+cat(variable, 'mediana:', mediana)
+```
+
+```{r moveis_qt}
+variable = 'moveis_qt'
+title = 'Quantidade de móveis'
+x_limits = c(0, 150)
+bins = 150
+bar_graf(df, variable, x_limits, title, bins)
+
+y_limits = c(0, 150)
+box_plot(df, variable, y_limits, title)
+
+media = mean(df[[variable]])
+mediana = median(df[[variable]])
+cat(variable, 'media:', media, '\n')
+cat(variable, 'mediana:', mediana)
+```
+
+```{r moveis_vl_bem}
+variable = 'moveis_vl_bem'
+title = 'Valor dos móveis'
+x_limits = c(0, 20000000)
+bins = 1000000
+bar_graf(df, variable, x_limits, title, bins)
+
+y_limits = c(0, 20000000)
+box_plot(df, variable, y_limits, title)
+
+media = mean(df[[variable]])
+mediana = median(df[[variable]])
+cat(variable, 'media:', media, '\n')
+cat(variable, 'mediana:', mediana)
+```
+
+```{r semoventes_vl_bem}
+variable = 'semoventes_vl_bem'
+title = 'Valor dos semoventes'
+x_limits = c(0, 10000000)
+bins = 1000000
+bar_graf(df, variable, x_limits, title, bins)
+
+y_limits = c(0, 10000000)
+box_plot(df, variable, y_limits, title)
+
+media = mean(df[[variable]])
+mediana = median(df[[variable]])
+cat(variable, 'media:', media, '\n')
+cat(variable, 'mediana:', mediana)
+```
+
+```{r vl_opr_cred_emprest_financ}
+variable = 'vl_opr_cred_emprest_financ'
+title = 'CREDITO_EMPRESTIMOS_E_FINANCIAMENTOS_VL_OPR_I'
+x_limits = c(0, 1000000)
+bins = 100
+bar_graf(df, variable, x_limits, title, bins)
+
+y_limits = c(0, 1000000)
+box_plot(df, variable, y_limits, title)
+
+media = mean(df[[variable]])
+mediana = median(df[[variable]])
+cat(variable, 'media:', media, '\n')
+cat(variable, 'mediana:', mediana)
+```
+
+
+```{r valor_custeio_interno_vincendo}
+variable = 'valor_custeio_interno_vincendo'
+title = 'VALOR_CUSTEIO_INTERNO_VINCENDO'
+x_limits = c(0, 2500000)
+bins = 1000
+bar_graf(df, variable, x_limits, title, bins)
+
+y_limits = c(0, 2500000)
+box_plot(df, variable, y_limits, title)
+
+media = mean(df[[variable]])
+mediana = median(df[[variable]])
+cat(variable, 'media:', media, '\n')
+cat(variable, 'mediana:', mediana)
+```
+
+
+```{r valor_investimento_interno_vincendo}
+variable = 'valor_investimento_interno_vincendo'
+title = 'VALOR_INVESTIMENTO_INTERNO_VINCENDO'
+x_limits = c(0, 2000000)
+bins = 1000
+bar_graf(df, variable, x_limits, title, bins)
+
+y_limits = c(0, 2000000)
+box_plot(df, variable, y_limits, title)
+
+media = mean(df[[variable]])
+mediana = median(df[[variable]])
+cat(variable, 'media:', media, '\n')
+cat(variable, 'mediana:', mediana)
+```
+
+
+```{r qt_prod}
+variable = 'qt_prod'
+title = 'QT_PROD'
+x_limits = c(0, 80)
+bins = 80
+bar_graf(df, variable, x_limits, title, bins)
+
+y_limits = c(0, 80)
+box_plot(df, variable, y_limits, title)
+
+media = mean(df[[variable]])
+mediana = median(df[[variable]])
+cat(variable, 'media:', media, '\n')
+cat(variable, 'mediana:', mediana)
+```
+
+
+```{r area_total_pro}
+variable = 'area_total_pro'
+title = 'AREA_TOTAL_PRO'
+x_limits = c(0, 200000)
+bins = 1000000
+bar_graf(df, variable, x_limits, title, bins)
+
+y_limits = c(0, 200000)
+box_plot(df, variable, y_limits, title)
+
+media = mean(df[[variable]])
+mediana = median(df[[variable]])
+cat(variable, 'media:', media, '\n')
+cat(variable, 'mediana:', mediana)
+```
+
+
+```{r qt_prod_propria}
+variable = 'qt_prod_propria'
+title = 'QT_PROD_PROPRIA'
+x_limits = c(0, 40)
+bins = 40
+bar_graf(df, variable, x_limits, title, bins)
+
+y_limits = c(0, 40)
+box_plot(df, variable, y_limits, title)
+
+media = mean(df[[variable]])
+mediana = median(df[[variable]])
+cat(variable, 'media:', media, '\n')
+cat(variable, 'mediana:', mediana)
+```
+
+
+```{r target}
+variable = 'target'
+title = 'Público Ouro Vida Produtor Rural'
+
+df_aux['target'] <- factor(df[['target']])
+
+# As vezes, somente o gráfico fica difícil de ver algumas categorias. Assim, é interessante montar uma tabela mostrando quantas observações cada categoria possui.
+value_counts <- count(df, .dots = variable) 
+value_counts$percent <-(value_counts$n/sum(value_counts$n)*100)
+value_counts <- value_counts[order(-value_counts$percent),]
+value_counts$percent <- sprintf("%0.2f%%", value_counts$percent)
+head(value_counts, n = Inf)
+
+# Plota o grafico de frequencia
+bar_graph_categoric_var(df_aux, variable, title, x_rotation = 0)
+```
+
+
+Estudar a distribuição de uma variável por vezes não traz muita informação.
+Os gráficos acima são bons para verificar se nenhuma variável possui uma concentração estranha.
+A análise das variáveis fica mais interessante quando se estuda a relação de uma variável com a outra.
+Para isso, primeiro estudou-se a matriz de correlação. Depois, diversos gráficos de correlação bivariada.
+E finalmente a distribuição de cada variável contra a target.
+
+
+```{r correlation, fig.width = 10,fig.height = 11}
+summary(df)
+
+# Para estudar a relação entre as variáveis, primeiro foi feito um heatmap com a correlação entre as variáveis numéricas.
+# Depois, o pairplot entre as variáveis.
+
+df_corr <- select(df, 'target', 'idade_cliente_anos', 'qt_tmp_rlc', 'qt_dpte', 'valor_proposta_cred', 'valor_agro_interno_vincendo', 'valor_custeio_interno_vincendo', 'valor_investimento_interno_vincendo', 'vl_opr_cred_emprest_financ', 'imovel_rural_vl_bem', 'imovel_urbano_vl_bem' , 'moveis_qt', 'moveis_vl_bem', 'semoventes_vl_bem', 'qt_prod', 'qt_prod_propria', 'area_total_pro')
+
+cormat <- round(cor(df_corr),2)
+# Get lower triangle of the correlation matrix
+get_lower_tri<-function(cormat){
+  cormat[upper.tri(cormat)] <- NA
+  return(cormat)
+}
+# Get upper triangle of the correlation matrix
+get_upper_tri <- function(cormat){
+  cormat[lower.tri(cormat)]<- NA
+  return(cormat)
+}
+upper_tri <- get_upper_tri(cormat)
+melted_cormat <- melt(upper_tri, na.rm = TRUE)
+
+
+ggplot(data = melted_cormat, aes(Var2, Var1, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab", 
+   name="Pearson\nCorrelation") +
+  coord_fixed() + 
+  geom_text(aes(Var2, Var1, label = value), color = "black", size = 4) +
+  theme_minimal()+ 
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 1, size = 10, hjust = 1),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.border = element_blank(),
+    panel.background = element_blank(),
+    axis.ticks = element_blank())
+```
+
+
+Não necessariamente porque uma variável possui alta correlação com outra que ela deve ser excluida.
+Porém, o modelo já possui muitas variáveis e não será perda significativa em excluir algumas delas. 
+
+Outro ponto importante é que, para fazer essa matriz, foi utilizada a correlação de Pearson, que normalmente é utilizada somente para identificar relações lineares. Isso quer dizer que ela pode não funcionar muito bem para capturar a relação entre variáveis ordinais como, por exemplo, da variável target.
+
+Uma outra ferramenta poderosa para identificar correlação entre as variáveis é o pairplot.
+
+
+```{r pairplot_1}
+df_pairplot <- select(df, 'target', 'idade_cliente_anos', 'qt_tmp_rlc', 'qt_dpte')
+cols <- character(nrow(df_pairplot))
+cols[] <- "black"
+cols[df_pairplot$target == 0] <- "red"
+cols[df_pairplot$target == 1] <- "blue"
+pairs(df_pairplot, col = cols)
+```
+
+
+```{r pairplot_2}
+df_pairplot <-  select(df, 'target', 'valor_proposta_cred', 'valor_agro_interno_vincendo')
+pairs(df_pairplot, col = cols)   # cols definido em pairplot_1
+```
+
+
+```{r pairplot_3}
+df_pairplot <-  select(df, 'target', 'valor_custeio_interno_vincendo', 'valor_investimento_interno_vincendo', 'vl_opr_cred_emprest_financ')
+pairs(df_pairplot, col = cols)   # cols definido em pairplot_1
+```
+
+
+```{r pairplot_4}
+df_pairplot <-  select(df, 'target', 'imovel_rural_vl_bem', 'imovel_urbano_vl_bem')
+pairs(df_pairplot, col = cols)   # cols definido em pairplot_1
+```
+
+
+```{r pairplot_5}
+df_pairplot <-  select(df, 'target', 'moveis_qt', 'moveis_vl_bem', 'semoventes_vl_bem')
+pairs(df_pairplot, col = cols)   # cols definido em pairplot_1
+```
+
+
+```{r pairplot_6}
+df_pairplot <-  select(df, 'target', 'qt_prod', 'qt_prod_propria', 'area_total_pro')
+pairs(df_pairplot, col = cols)   # cols definido em pairplot_1
+```
+
+
+Como não existiu muita correlação entre as variáveis, já era esperado que os pairplots apresentassem somente uma nuvem de pontos.
+Para melhorar a visualização, foram mostrados os boxplot de cada variável para o público que contratrou e o que não contratou.
+Começando pelas variáveis categóricas:
+
+
+```{r bar_graph_stacked_categoric_var}
+bar_graph_stacked_categoric_var <- function(df, variable, title, x_rotation = 45, ...) {
+  plotdata <- df %>%
+    group_by(.data[[variable]], target) %>%
+    summarize(n = n()) %>% 
+    mutate(pct = n/sum(n),
+           lbl = scales::percent(pct))
+  # Coleta as colunas ordenadas por percentual de contratação
+  plotdata_aux <- filter(plotdata, target == 1)
+  plotdata_aux <- plotdata_aux[order(-plotdata_aux$pct),]
+  plotdata[variable] <- factor(plotdata[[variable]], levels = plotdata_aux[[variable]])  
+  # Plota
+  ggplot(plotdata, 
+  aes(x = factor(plotdata[[variable]]),
+    y = pct,
+    fill = factor(target))) +
+  geom_bar(stat = "identity", position = "fill") +
+  geom_text(aes(label = lbl), size = 3, position = position_stack(vjust = 0.5)) +
+  scale_fill_brewer(palette = "Set1") +
+  labs(x = '', y = "Percent", 
+       fill = "Target",
+       title = title) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),   # Para centralizar o título
+          panel.background = element_rect(fill = 'white', colour = 'white'),
+          axis.text.x = element_text(angle = x_rotation, size = 8, hjust = 1)) 
+}
+
+tabela_contratados <- function(df, variable) {
+  # Conta observações por categoria
+  value_counts <- count(df, .dots = variable) 
+  value_counts$percent_aux <-(value_counts$n/sum(value_counts$n)*100)
+  value_counts$percent <- sprintf("%0.2f%%", value_counts$percent_aux)
+  # Contratação por categoria
+  percent_cat <- count(filter(df, target == 1), .dots = variable) 
+  colnames(percent_cat) <- c(variable, 'contrataram')
+  # Junta as tabelas
+  value_counts <- merge(value_counts, percent_cat, by.x = variable, by.y = variable, all.x = TRUE)   # all.x = TRUE is left join
+  value_counts <- mutate_at(value_counts, vars(contrataram), ~replace_na(., 0))
+  # Percentual de contratação por categoria
+  value_counts$percentual_contratacao_aux <- value_counts$contrataram/value_counts$n
+  value_counts$percentual_contratacao <- sprintf("%0.2f%%", value_counts$percentual_contratacao_aux*100)
+  #imprime 
+  value_counts <- value_counts[order(-value_counts$percent_aux),]
+  print(head(select(value_counts, variable, n, percent), n = Inf))
+  value_counts <- value_counts[order(-value_counts$percentual_contratacao_aux),]
+  head(select(value_counts, variable, contrataram , percentual_contratacao), n = Inf)
+}
+```
+
+
+```{r target_FINALIDADE}
+variable = 'finalidade'
+title = 'Finalidade'
+tabela_contratados(df, variable)
+bar_graph_stacked_categoric_var(df, variable, title, x_rotation = 45)
+```
+
+```{r target_NOME_ITEM_FINANCIADO}
+variable = 'nome_item_financiado'
+title = 'Item financiado'
+tabela_contratados(df, variable)
+bar_graph_stacked_categoric_var(df, variable, title, x_rotation = 45)
+```
+
+```{r junta_categorias_NOME_ITEM_FINANCIADO}
+variable <- 'nome_item_financiado'
+new_variable <- 'NOME_ITEM_FINANCIADO_2'
+
+new_categories_NOME_ITEM_FINANCIADO <- function(x) {
+   nao_mudar = c('BOVINOCULTURA', 'SOJA')
+   cat_LAVOURA_nao_outros = c('LAVOURA DE SOJA', 'LAVOURA DE MILHO', 'LAVOURA DE CAFE', 'LAVOURA DE TRIGO')
+   if (x %in% nao_mudar){
+     return(x)
+   }
+   if (grepl('LAVOURA', x, fixed = TRUE)){
+     if (x %in% cat_LAVOURA_nao_outros){
+       return(x)
+     }
+     else{
+       return('LAVOURA_OUTROS')
+     }
+   }
+   return('DEMAIS')
+}
+df[new_variable] <- sapply(df[[variable]], function(x) new_categories_NOME_ITEM_FINANCIADO(x))
+# Drop variable
+df <- select(df, -variable)
+```
+
+
+```{r target_NOME_ITEM_FINANCIADO_2}
+variable = 'NOME_ITEM_FINANCIADO_2'
+title = 'Item financiado 2'
+tabela_contratados(df, variable)
+bar_graph_stacked_categoric_var(df, variable, title, x_rotation = 45)
+```
+
+Agora, os estudos das variáveis contínuas:
+
+
+```{r box_plot_graph_hue}
+box_plot_graph_hue <- function(df, df_1, df_0, variable, title, y_limits, ...) {
+  boxplot(df[[variable]] ~ df$target,ylim = y_limits, main = title, col = c('orange', 'blue'), xlab = 'target', ylab = variable)
+  points(1, mean(df_0[[variable]]), col = 'red')
+  points(2, mean(df_1[[variable]]), col = 'red')
+}
+
+print_mean_median <- function(df, variable) {
+  df_0_or_negative <- filter(df, df[[variable]] <= 0)
+
+  media_contratou <- mean(df_contratou[[variable]])
+  mediana_contratou <- median(df_contratou[[variable]])
+  media_nao_contratou <- mean(df_nao_contratou[[variable]])
+  mediana_nao_contratou <- median(df_nao_contratou[[variable]]) 
+  
+  cat(variable, 'média para quem contratou:', media_contratou, '\n')
+  cat(variable, 'mediana para quem contratou:', mediana_contratou, '\n')
+  cat(variable, 'média para quem não contratou:', media_nao_contratou, '\n')
+  cat(variable, 'mediana para quem não contratou:', mediana_nao_contratou, '\n')
+  cat(variable, 'quantidade de 0 ou -1:', dim(df_0_or_negative)[1], 'percentual', sprintf("%0.2f%%", (dim(df_0_or_negative)[1]/dim(df)[1]*100)))
+}
+```
+
+
+```{r bivariada_VALOR_PROPOSTA_CRED}
+df_contratou <- filter(df, target == 1)
+df_nao_contratou <- filter(df, target == 0)
+
+variable = 'valor_proposta_cred'
+title = 'Valor da proposta'
+
+y_lim = c(1000, 1000000)
+box_plot_graph_hue(df, df_contratou, df_nao_contratou, variable, title, y_lim)
+print_mean_median(df, variable)
+```
+
+
+```{r bivariada_IDADE_CLIENTE_ANOS}
+variable = 'idade_cliente_anos'
+title = 'Idade do cliente'
+
+y_lim = c(15, 85)
+box_plot_graph_hue(df, df_contratou, df_nao_contratou, variable, title, y_lim)
+print_mean_median(df, variable)
+```
+
+
+```{r bivariada_qt_dias_formalizacao_inicio_seg}
+variable = 'qt_dias_formalizacao_inicio_seg'
+title = 'dias percorridos entre a formalização do crédito e a contratação do seguro'
+
+y_lim = c(0, 100)
+box_plot_graph_hue(df, df_contratou, df_nao_contratou, variable, title, y_lim)
+print_mean_median(df, variable)
+```
+
+
+```{r bivariada_QT_TMP_RLC}
+variable = 'qt_tmp_rlc'
+title = 'Tempo de relacionamento'
+
+y_lim = c(0, 80)
+box_plot_graph_hue(df, df_contratou, df_nao_contratou, variable, title, y_lim)
+print_mean_median(df, variable)
+```
+
+
+```{r bivariada_QT_DPTE}
+variable = 'qt_dpte'
+title = 'Quantidade de dependentes'
+
+y_lim = c(0, 15)
+box_plot_graph_hue(df, df_contratou, df_nao_contratou, variable, title, y_lim)
+print_mean_median(df, variable)
+```
+
+Apesar de ser uma variavel contínua, talvez considera-la como uma variável categórica seja melhor.
+
+```{r target_QT_DPTE}
+variable = 'qt_dpte'
+title = 'Quantidade de dependentes'
+tabela_contratados(df, variable)
+bar_graph_stacked_categoric_var(df, variable, title, x_rotation = 45)
+```
+
+Agora é possível ver melhor a relação entre QT_DPTE e a target e, assim, juntar algumas categorias.
+
+
+```{r junta_QT_DPTE}
+variable <- 'qt_dpte'
+new_variable <- 'QT_DPTE_2'
+
+new_categories_QT_DPTE <- function(x) {
+   if (x %in% c(2, 3)){  # Juntado para evitar inversão
+     return('2 ou 3')
+   }
+  if (x >= 4){  # Juntado devido ao baixo número de observações
+     return('4 ou mais')
+   }
+   return(x)
+}
+df[new_variable] <- sapply(df[[variable]], function(x) new_categories_QT_DPTE(x))
+# Drop variable
+df <- select(df, -variable)
+```
+
+
+```{r bivariada_QT_DPTE_2}
+variable = 'QT_DPTE_2'
+title = 'Quantidade de dependentes 2'
+tabela_contratados(df, variable)
+bar_graph_stacked_categoric_var(df, variable, title, x_rotation = 45)
+```
+
+
+```{r bivariada_valor_agro_interno_vincendo}
+variable = "valor_agro_interno_vincendo"
+title = 'valor_agro_interno_vincendo'
+
+y_lim = c(0, 8000000)
+box_plot_graph_hue(df, df_contratou, df_nao_contratou, variable, title, y_lim)
+print_mean_median(df, variable)
+```
+
+
+```{r bivariada_valor_custeio_interno_vincendo}
+variable = "valor_custeio_interno_vincendo"
+title = 'valor_custeio_interno_vincendo'
+
+y_lim = c(0, 8000000)
+box_plot_graph_hue(df, df_contratou, df_nao_contratou, variable, title, y_lim)
+print_mean_median(df, variable)
+```
+
+
+```{r bivariada_valor_investimento_interno_vincendo}
+variable = "valor_investimento_interno_vincendo"
+title = 'valor_investimento_interno_vincendo'
+
+y_lim = c(0, 8000000)
+box_plot_graph_hue(df, df_contratou, df_nao_contratou, variable, title, y_lim)
+print_mean_median(df, variable)
+```   
+
+
+```{r bivariada_vl_opr_cred_emprest_financ}
+variable = "vl_opr_cred_emprest_financ"
+title = 'vl_opr_cred_emprest_financ'
+
+y_lim = c(0, 5000000)
+box_plot_graph_hue(df, df_contratou, df_nao_contratou, variable, title, y_lim)
+print_mean_median(df, variable)
+```   
+
+
+```{r bivariada_imovel_rural_vl_bem}
+variable = 'imovel_rural_vl_bem'
+title = 'Valor dos imóveis rurais'
+
+y_lim = c(0, 180000000)
+box_plot_graph_hue(df, df_contratou, df_nao_contratou, variable, title, y_lim)
+print_mean_median(df, variable)
+```   
+
+
+```{r bivariada_imovel_urbano_vl_bem}
+variable = 'imovel_urbano_vl_bem'
+title = 'Valor dos imóveis urbanos'
+
+y_lim = c(0, 8500000)
+box_plot_graph_hue(df, df_contratou, df_nao_contratou, variable, title, y_lim)
+print_mean_median(df, variable)
+``` 
+
+
+```{r bivariada_MOVEIS_QT}
+variable = 'moveis_qt'
+title = 'Quantidade de imóveis'
+
+y_lim = c(0, 150)
+box_plot_graph_hue(df, df_contratou, df_nao_contratou, variable, title, y_lim)
+print_mean_median(df, variable)
+``` 
+
+
+```{r bivariada_MOVEIS_VL_BEM}
+variable = 'moveis_vl_bem'
+title = 'Valor dos imóveis'
+
+y_lim = c(0, 40000000)
+box_plot_graph_hue(df, df_contratou, df_nao_contratou, variable, title, y_lim)
+print_mean_median(df, variable)
+``` 
+
+
+```{r bivariada_SEMOVENTES_VL_BEM}
+variable = 'semoventes_vl_bem'
+title = 'Valor dos semoventes'
+
+y_lim = c(0, 30000000)
+box_plot_graph_hue(df, df_contratou, df_nao_contratou, variable, title, y_lim)
+print_mean_median(df, variable)
+``` 
+
+
+```{r bivariada_QT_PROD}
+variable = 'qt_prod'
+title = 'QT_PROD'
+
+y_lim = c(0, 100)
+box_plot_graph_hue(df, df_contratou, df_nao_contratou, variable, title, y_lim)
+print_mean_median(df, variable)
+``` 
+
+
+```{r bivariada_QT_PROD_PROPRIA}
+variable = 'qt_prod_propria'
+title = 'QT_PROD_PROPRIA'
+
+y_lim = c(0, 100)
+box_plot_graph_hue(df, df_contratou, df_nao_contratou, variable, title, y_lim)
+print_mean_median(df, variable)
+``` 
+
+
+```{r bivariada_AREA_TOTAL_PRO}
+variable = 'area_total_pro'
+title = 'AREA_TOTAL_PRO'
+
+y_lim = c(0, 500000)
+box_plot_graph_hue(df, df_contratou, df_nao_contratou, variable, title, y_lim)
+print_mean_median(df, variable)
+``` 
+
+
+
+

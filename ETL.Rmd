@@ -1,0 +1,218 @@
+---
+title: "R ETL"
+author: "Fabiano Caetano Foroni"
+date: '2022-07-05'
+output:
+  html_document: 
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE) #código no html final
+knitr::opts_chunk$set(message = FALSE) #mensagens geradas pelo código no html final
+```
+
+Objetivos: 
+
+ETL:
+- Ler parquet;
+- checar informação duplicada;
+- checar missing.
+
+Para ler aquivos parquet, além do tidyverse, foi necessária a biblioteca arrow, através do método read_parquet().
+
+```{r read_parquet}
+library(tidyverse)
+library(arrow)
+
+df = read_parquet('base_seguro_vida_prod_rural.parquet')
+print.data.frame(df, max = 300)
+```
+
+Como é possível ver, uma vez que se lê uma tabela com o método, a tabela é convertida em um data frame 'Tibble'.
+
+Próximo passo é a remoção de duplicados. O problema de alteração na volumetria só chega a de fato ser um problema se duas observações com a mesma chave possuem valores diferentes para as variáveis.
+
+
+```{r remove_duplicates}
+# Remove linhas duplicadas.
+cat('Quantidade de registros:\n')
+cat('Quantidade inicial de linhas: ', nrow(df))
+df <- distinct(df)
+cat('\nQuantidade após retirada de duplicados: ', nrow(df))
+```
+
+Em seguida, foi analisada a quantidade de missing em cada coluna.
+
+```{r missing}
+# Verica nulos por coluna
+missing_df <- data.frame(sapply(df, function(x) sum(is.na(x))/length(x)))
+# renomeia a coluna
+colnames(missing_df) <- 'missing'
+# Transforma o index em coluna
+missing_df <- cbind(rownames(missing_df), missing_df)
+# Ordena a tabela
+missing_df <- missing_df[order(-missing_df$missing),]
+# retira notação cientifica
+options(scipen = 50)
+# imprime valores
+print.data.frame(missing_df, digits = 1)
+```
+
+Algumas variáveis possuíram problema de missing.A mais grave é a 'valor_seg_contr_2022' com mais de 95% de missing.
+Quando uma coluna possui muitos missings, acima de 80%, e se tem certeza de que não há problemas no ETL, a única solução é deletar a coluna.
+
+```{r valor_seg_contr_2022}
+df <- select(df, -valor_seg_contr_2022)
+```
+
+
+Entretanto, caso o percentual de missing seja menor, por exemplo, 65% em 'qt_dpte', vale a pena tentar entender a variável antes de tomar uma decisão.
+Assim, foi feita uma rápida análise nas variáveis: 'qt_dpte', 'target_seguro_vida_prod_rural', 'seg_vida_prod_rural_dt_inicio' e 'qt_dias_formalizacao_inicio_seg'.
+
+
+```{r qt_dpte}
+# Verifica valores de qt_dpte
+table(df['qt_dpte'])
+
+# Preenche qt_dpte
+df <- mutate_at(df, vars(qt_dpte), ~replace_na(., 0))
+
+table(df['qt_dpte'])
+```
+
+É possível perceber que a variável 'qt_dpte' (quantidade de dependentes) não possui 0.
+Investigando mais a variável e conversando com o os responsáveis do negócio, descobriu-se que na verdade o missing significa 0 dependentes.
+Desse modo, ao invés de dar drop na coluna, foi possível preencher o missing com 0.
+
+```{r target_seguro_vida_prod_rural}
+
+# Verifica valores de target_seguro_vida_prod_rural
+table(df['target_seguro_vida_prod_rural'])
+
+# Preenche a variável target.
+df <- mutate(df, target = case_when(
+  target_seguro_vida_prod_rural == 'CONTRATOU' ~ 1,
+  TRUE ~ 0 #is.na(target_seguro_vida_prod_rural) ~ 0
+))
+
+# Drop em target_seguro_vida_prod_rural
+df <- select(df, -target_seguro_vida_prod_rural)
+
+table(df['target'])
+```
+
+A coluna 'target_seguro_vida_prod_rural' é a variável target. Não podem ter observações com missing nela.
+Felizmente, o missing significa que não houve contratação.
+Assim, foi montada a target sendo 1 quando 'target_seguro_vida_prod_rural' é igual a CONTRATOU, e sendo 0 quando 'target_seguro_vida_prod_rural' é outro valores ou missing.
+
+```{r seg_vida_prod_rural_dt_inicio}
+
+# Verifica seg_vida_prod_rural_dt_inicio
+head(table(df['seg_vida_prod_rural_dt_inicio']), 30)
+```
+
+```{r qt_dias_formalizacao_inicio_seg}
+# Verifica qt_dias_formalizacao_inicio_seg
+head(table(df['qt_dias_formalizacao_inicio_seg']), 30)
+```
+
+As variáveis 'seg_vida_prod_rural_dt_inicio' e 'qt_dias_formalizacao_inicio_seg' não foram possíveis de analisar somente com um estudo de frequencia. Foi necessário entender o significado delas.
+'seg_vida_prod_rural_dt_inicio' é o dia em que o cliente contratou o seguro de vida para produtor rural.
+'qt_dias_formalizacao_inicio_seg' é a quantidade de dias decorridos entre a contratação do crédito e a contratação do seguro.
+Assim, é natural que essas duas variáveis tenham tanto missing, pois elas somente possuem valor quando a target é igual a 1.
+A coluna 'seg_vida_prod_rural_dt_inicio', por ser de data, não será utilizada no modelo. Já a coluna 'qt_dias_formalizacao_inicio_seg', apesar de possuir valor somente para quem contratou o seguro, é possível prencher os nulos com uma distribuição que seja idêntica a distribuição da variável quando target é 1. Porém, isso somente foi feito no processo de modelagem quando separamos nossa base em treino e teste.
+
+```{r missing_2}
+# Vamos analisar os nulos novamente para termos certeza de que não esquecemos nenhuma coluna.
+# Verica nulos por coluna
+missing_df <- data.frame(sapply(df, function(x) sum(is.na(x))/length(x)))
+# renomeia a coluna
+colnames(missing_df) <- 'missing'
+# Transforma o index em coluna
+missing_df <- cbind(rownames(missing_df), missing_df)
+# Ordena a tabela
+missing_df <- missing_df[order(-missing_df$missing),]
+print.data.frame(missing_df, digits = 1)
+```
+
+Colunas com menos de 10% de missing são normais.
+Quando a variável é categórica, o melhor a se fazer é preencher os nulos com 'sem informação'.
+Já quando a variável é numérica, é possível preencher com um valor fora do range, com a média ou com a mediana.
+Em modelos lineares, é melhor escolher a média pois essas métricas impactam menos no cálculo dos coeficientes. Porém, em modelos baseados em árvores, é melhor escolher um valor fora do range, pois os modelos em árvore conseguem utilizar a informação de missing desta forma no modelo.
+
+```{r substitui_nulos}
+# Preenche o nulos
+df <- mutate_at(df, vars(grt_hipoteca), ~replace_na(., 'Sem_informacao'))
+
+# Para as variáveis de valor, o uso da média chega a impactar visivelmente a distribuição das variáveis.
+# Desse modo, colocou-se o valor de -1 para indicar missing. 
+# Isso irá prejudicar qualquer modelo linear com essas variáveis, porém melhorará a performance de modelos baseados em random forest ou neural network.
+
+df <- mutate_at(df, vars(valor_agro_interno_vincendo), ~replace_na(., -1))
+df <- mutate_at(df, vars(valor_investimento_interno_vincendo), ~replace_na(., -1))
+df <- mutate_at(df, vars(valor_custeio_interno_vincendo), ~replace_na(., -1))
+df <- mutate_at(df, vars(imovel_rural_vl_bem), ~replace_na(., -1))
+df <- mutate_at(df, vars(imovel_urbano_vl_bem), ~replace_na(., -1))
+df <- mutate_at(df, vars(moveis_qt), ~replace_na(., -1))
+df <- mutate_at(df, vars(moveis_vl_bem), ~replace_na(., -1))
+df <- mutate_at(df, vars(semoventes_vl_bem), ~replace_na(., -1))
+df <- mutate_at(df, vars(qt_prod), ~replace_na(., -1))
+df <- mutate_at(df, vars(area_total_pro), ~replace_na(., -1))
+df <- mutate_at(df, vars(qt_prod_propria), ~replace_na(., -1))
+df <- mutate_at(df, vars(vl_opr_cred_emprest_financ ), ~replace_na(., -1))
+
+```
+
+A seguir verificou-se o tipo das variáveis para ter certeza de que não existe nenhum número como string ou vice versa.
+
+```{r verify_type}
+sapply(df, class)
+```
+
+Pelo tipo das variáveis, observou-se que existem 5 variáveis categóricas: 'TIP_CART', 'NOME_MDLD', 'NOME_ITEM_FINANCIADO', 'FINALIDADE' e 'GRT_HIPOTECA.'
+
+Antes de começar a estudar a distribuição de variável por variável, foi feita uma analise mais superficial.
+Primeiro, um summary nas variáveis para ver se não existe nenhuma concentração em algum valor.
+Depois, o estudo da volumetria da base e a variável resposta mês a mês.
+
+```{r summary}
+summary(df)
+```
+
+A única variável com uma distribuição um pouco preocupante é a 'imovel_urbano_vl_bem' que possui mais de 50% de seus valores como missing ou zerados.
+Entretanto, é natural que isso ocorra, pois nossa base é de clientes rurais. Então é natural que boa parte dos clientes possuam uma propriedade rural e nenhuma urbana cadastrada.
+Com o 'describe' também podemos ver que cada coluna possui uma magnitude de valor diferentes. Isso pode trazer problemas em alguns modelos, principalmente se for usar algum termo de regularização. Um dos hiperparametros dos modelos de árvore é a regularização. Assim, o ideal é normalizar esses valores para que a regularização não penalize mais as variáveis de magnitude maior. Porém, isso somente será feito na modelagem quando separar a base em treino e teste.
+
+
+```{r observações_mensais}
+contratos_mes <- df %>% 
+      group_by(month = lubridate::floor_date(data_formalizacao, "month")) %>%
+      summarize(Contratos_mes = length(data_formalizacao))
+plot(contratos_mes[,c("month","Contratos_mes")], type = "l", col = "blue")
+```
+
+É possível ver que as observações começam em janeiro de 2019 e terminam em janeiro de 2022.
+Além disso, percebeu-se que a contração do crédito agropecuário é cíclica com vale no início do ano.
+
+```{r contratações_mensais}
+contrataçoes_mes <- df %>% 
+      group_by(month = lubridate::floor_date(data_formalizacao, "month")) %>%
+      summarize(contrataçoes_mes = mean(target))
+plot(contrataçoes_mes[,c("month","contrataçoes_mes")], type = "l", col = "blue")
+```
+
+Apesar de não ser esperado que a target apresente um percentual crescente durante o tempo, esse comportamento é o esperado devido a natureza do negócio:
+Um cliente pode contratar o seguro de vida produtor rural a qualquer momento de duração de seu produto de crédito. Além disso, somente pode-se marcar que um cliente não contratou o seguro se o cliente contratou um crédito, finalizou a operação e não contratou. Caso a pessoa não tenha contratado o seguro mas continua com a operação de crédito em aberto, não se pode marcá-la como não contratou e, por isso, ela foi descartada do público.
+Desse modo, considerando que a base possui operações de crédito com até 3 anos de vida, é natural que a marcação de não contratou diminua ao longo do tempo e seja substituída por "não contratou ainda", o que significa deletar a observação da base.
+
+Esse gráfico de contratação por mês é importante principalmente casp se pretenda realizar um teste out of sample. Normalmente, testes out of sample são realizados nos últimos meses de informação disponível. Entretanto, não é possível fazer isso aqui, pois, quase todas as observações nos últimos dois meses são de clientes que contrataram o seguro. Assim, pelo gráfico percebe-se que o ideal é escolher os meses de setembro e outubro de 2020 como out of sample, pois, depois desta data, a taxa de contratação começa a aumentar muito.
+
+
+
+
+
+
+
+
+
